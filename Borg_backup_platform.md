@@ -294,7 +294,7 @@ Select the client and go to **Restore** window:
 - Click **Download** (files downloaded to your local machine)
 
 
-```
+
 
 
 
