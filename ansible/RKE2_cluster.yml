@@ -1,0 +1,247 @@
+# Requires a clean linux template to be available 
+
+
+# =======================================================================
+# PHASE 1: INFRASTRUCTURE PROVISIONING (PROXMOX API)
+# =======================================================================
+- name: "Infrastructure Provisioning"
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    node_count: 3
+    node_name: "pve"
+    template_id: 9000
+    vm_prefix: "rke2-node"
+    vm_user: "ansible"
+    domain: "astro.lan"
+
+  tasks:
+    - name: "1. API: Get Next Available VMID"
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:8006/api2/json/cluster/nextid"
+        method: GET
+        headers: { Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}" }
+        validate_certs: false
+      register: next_vmid_api
+      delegate_to: localhost
+
+    - name: "2. Set Starting VMID Fact"
+      ansible.builtin.set_fact:
+        start_id: "{{ next_vmid_api.json.data | int }}"
+
+    - name: "3. API: Clone VMs"
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ ansible_host }}"
+        api_user: "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id: "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node: "{{ node_name }}"
+        vmid: "{{ template_id }}"
+        clone: "{{ template_id }}"
+        newid: "{{ start_id | int + item | int }}"
+        name: "{{ vm_prefix }}-{{ start_id | int + item | int }}"
+        full: true
+        agent: 1
+        state: present
+        timeout: 600
+      loop: "{{ range(0, node_count | int) | list }}"
+      loop_control:
+        pause: 5
+      delegate_to: localhost
+
+    - name: "4. API: Start VMs"
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ ansible_host }}"
+        api_user: "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id: "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node: "{{ node_name }}"
+        vmid: "{{ start_id | int + item | int }}"
+        state: started
+      loop: "{{ range(0, node_count | int) | list }}"
+      delegate_to: localhost
+
+    - name: "5. API: Inject Identity & Sudoers"
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:8006/api2/json/nodes/{{ node_name }}/qemu/{{ start_id | int + item }}/agent/exec"
+        method: POST
+        headers: { Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}" }
+        body_format: json
+        body:
+          command:
+            - "bash"
+            - "-c"
+            - |
+              echo '{{ vm_prefix }}-{{ start_id | int + item }}' > /etc/hostname
+              hostname '{{ vm_prefix }}-{{ start_id | int + item }}'
+              useradd -m -s /bin/bash {{ vm_user }} || true
+              mkdir -p /home/{{ vm_user }}/.ssh
+              echo '{{ lookup('file', '~/.ssh/id_rsa.pub') }}' > /home/{{ vm_user }}/.ssh/authorized_keys
+              chown -R {{ vm_user }}:{{ vm_user }} /home/{{ vm_user }}/.ssh
+              chmod 700 /home/{{ vm_user }}/.ssh
+              chmod 600 /home/{{ vm_user }}/.ssh/authorized_keys
+              echo '{{ vm_user }} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ansible
+              chmod 440 /etc/sudoers.d/ansible
+              truncate -s 0 /etc/machine-id
+              reboot
+        validate_certs: false
+      register: agent_res
+      until: agent_res.status == 200
+      retries: 50
+      delay: 5
+      loop: "{{ range(0, node_count | int) | list }}"
+      delegate_to: localhost
+
+    - name: "6. Wait for Reboot"
+      ansible.builtin.pause:
+        seconds: 45
+
+    - name: "7. API: Discover IP Addresses"
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:8006/api2/json/nodes/{{ node_name }}/qemu/{{ start_id | int + item }}/agent/network-get-interfaces"
+        method: GET
+        headers: { Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}" }
+        validate_certs: false
+      register: vm_interfaces_api
+      until: "vm_interfaces_api.json.data.result | selectattr('name', 'ne', 'lo') | map(attribute='ip-addresses') | flatten | select('search', '20\\.0\\.0\\.') | list | length > 0"
+      retries: 50
+      delay: 5
+      loop: "{{ range(0, node_count | int) | list }}"
+      delegate_to: localhost
+
+    - name: "8. Inventory Assignment"
+      ansible.builtin.add_host:
+        name: "{{ vm_prefix }}-{{ start_id | int + item.item }}"
+        ansible_host: "{{ (item.json.data.result | selectattr('name', 'ne', 'lo') | map(attribute='ip-addresses') | flatten | select('search', '20\\.0\\.0\\.') | first)['ip-address'] }}"
+        groups: ["rke2_nodes", "{{ 'rke2_master' if idx == 0 else 'rke2_workers' }}"]
+        ansible_user: "{{ vm_user }}"
+        cluster_id_tag: "{{ start_id }}"
+        domain_name: "{{ domain }}"
+      loop: "{{ vm_interfaces_api.results }}"
+      loop_control: { index_var: idx }
+      delegate_to: localhost
+
+# =======================================================================
+# PHASE 2: RKE2 CLUSTER SETUP
+# =======================================================================
+- name: "RKE2 Cluster Setup"
+  hosts: rke2_nodes
+  gather_facts: false
+  become: true
+  vars:
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+    rke2_config_dir: "/etc/rancher/rke2"
+    rke2_kubeconfig: "/etc/rancher/rke2/rke2.yaml"
+    rke2_bin: "/var/lib/rancher/rke2/bin"
+
+  tasks:
+    - name: "9. Wait for SSH"
+      ansible.builtin.wait_for_connection:
+        timeout: 180
+
+    - name: "10. Install RKE2 Server"
+      ansible.builtin.shell: |
+        curl -sfL https://get.rke2.io | sh -
+      args:
+        creates: /usr/local/bin/rke2
+      when: "'rke2_master' in group_names"
+
+    - name: "11. Configure RKE2 Server with Calico CNI"
+      ansible.builtin.shell: |
+        mkdir -p {{ rke2_config_dir }}
+        cat > {{ rke2_config_dir }}/config.yaml <<EOF
+        write-kubeconfig-mode: "0644"
+        cni: calico
+        tls-san:
+          - "{{ ansible_host }}"
+        disable:
+          - rke2-ingress-nginx
+        EOF
+      when: "'rke2_master' in group_names"
+
+    - name: "12. Enable & Start RKE2 Server"
+      ansible.builtin.systemd:
+        name: rke2-server
+        enabled: true
+        state: started
+      when: "'rke2_master' in group_names"
+
+    - name: "13. Wait for RKE2 Node Token"
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/rke2/server/node-token
+        timeout: 300
+      when: "'rke2_master' in group_names"
+
+    - name: "14. Wait for Calico Pods to be Ready"
+      ansible.builtin.shell: |
+        {{ rke2_bin }}/kubectl wait pod \
+          --namespace kube-system \
+          --selector k8s-app=calico-node \
+          --for=condition=Ready \
+          --timeout=300s
+      environment:
+        KUBECONFIG: "{{ rke2_kubeconfig }}"
+      when: "'rke2_master' in group_names"
+
+    - name: "15. Fix Kubeconfig & PATH for ansible user"
+      ansible.builtin.shell: |
+        chmod 644 {{ rke2_kubeconfig }}
+        grep -q "KUBECONFIG" /home/{{ ansible_user }}/.bashrc || \
+          echo "export KUBECONFIG={{ rke2_kubeconfig }}" >> /home/{{ ansible_user }}/.bashrc
+        grep -q "{{ rke2_bin }}" /home/{{ ansible_user }}/.bashrc || \
+          echo "export PATH=\$PATH:{{ rke2_bin }}" >> /home/{{ ansible_user }}/.bashrc
+      when: "'rke2_master' in group_names"
+
+    - name: "16. Fetch Node Token from Master"
+      ansible.builtin.shell: "cat /var/lib/rancher/rke2/server/node-token"
+      register: rke2_token
+      delegate_to: "{{ groups['rke2_master'][0] }}"
+
+    - name: "17. Install RKE2 Agent on Workers"
+      ansible.builtin.shell: |
+        curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE="agent" sh -
+      args:
+        creates: /usr/local/bin/rke2
+      when: "'rke2_workers' in group_names"
+
+    - name: "18. Configure RKE2 Agent"
+      ansible.builtin.shell: |
+        mkdir -p {{ rke2_config_dir }}
+        cat > {{ rke2_config_dir }}/config.yaml <<EOF
+        server: "https://{{ hostvars[groups['rke2_master'][0]].ansible_host }}:9345"
+        token: "{{ rke2_token.stdout }}"
+        EOF
+      when: "'rke2_workers' in group_names"
+
+    - name: "19. Enable & Start RKE2 Agent"
+      ansible.builtin.systemd:
+        name: rke2-agent
+        enabled: true
+        state: started
+      when: "'rke2_workers' in group_names"
+
+    - name: "20. Wait for All Nodes to Join"
+      ansible.builtin.shell: |
+        {{ rke2_bin }}/kubectl get nodes --no-headers | grep -c "Ready"
+      environment:
+        KUBECONFIG: "{{ rke2_kubeconfig }}"
+      register: ready_nodes
+      until: ready_nodes.stdout | int == groups['rke2_nodes'] | length
+      retries: 30
+      delay: 10
+      delegate_to: "{{ groups['rke2_master'][0] }}"
+      run_once: true
+
+    - name: "21. Final Access Summary"
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "         CLUSTER DEPLOYMENT COMPLETE        "
+          - "============================================"
+          - "Master IP      : {{ ansible_host }}"
+          - "Cluster ID     : {{ cluster_id_tag }}"
+          - "CNI            : Calico"
+          - "Kubeconfig     : {{ rke2_kubeconfig }}"
+          - "kubectl path   : {{ rke2_bin }}/kubectl"
+          - "============================================"
+      when: "'rke2_master' in group_names"
