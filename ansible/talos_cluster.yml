@@ -1,0 +1,135 @@
+  # Requires a talos iso to be available
+  - name: "Auto-Provision Talos Cluster"
+    hosts: proxmox
+    gather_facts: false
+    vars:
+      # --- CONFIGURATION ---
+      worker_count: 2
+      node: "pve"
+      storage_pool: "local-lvm"
+      talos_iso_vol: "local:iso/metal-amd64.iso"
+      cluster_name: "talos-prod"
+      ip_subnet: "20.0.0"
+      bridge_interface: "vmbr0"
+
+    tasks:
+      - name: 1. Get next available VMID
+        ansible.builtin.uri:
+          url: "https://{{ ansible_host }}:8006/api2/json/cluster/nextid"
+          method: GET
+          headers:
+            Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
+          validate_certs: false
+        register: next_id_result
+        delegate_to: localhost
+
+      - name: 2. Build VM Plan
+        set_fact:
+          vm_plan: >-
+            {% set plan = [] %}
+            {% for i in range(0, worker_count + 1) %}
+            {%   set _ = plan.append({
+                  'role': ('controlplane' if i == 0 else 'worker'),
+                  'vmid': (next_id_result.json.data | int) + i,
+                  'name': 'talos-' + (next_id_result.json.data | string) + ('-master' if i == 0 else '-worker-' + i | string)
+                }) %}
+            {% endfor %}
+            {{ plan | to_json }}
+
+      - name: 3. Create VMs
+        community.proxmox.proxmox_kvm:
+          api_user: "{{ proxmox_token_id.split('!')[0] }}"
+          api_token_id: "{{ proxmox_token_id.split('!')[1] }}"
+          api_token_secret: "{{ proxmox_token_secret }}"
+          api_host: "{{ ansible_host }}"
+          node: "{{ node }}"
+          vmid: "{{ item.vmid }}"
+          name: "{{ item.name }}"
+          state: present
+          memory: 4096
+          cores: 2
+          cpu: host
+          scsihw: virtio-scsi-single
+          net: { net0: "virtio,bridge={{ bridge_interface }}" }
+          virtio: { virtio0: "{{ storage_pool }}:20" }
+          ide: { ide2: "{{ talos_iso_vol }},media=cdrom" }
+          boot: "order=ide2;virtio0"
+        loop: "{{ vm_plan | from_json }}"
+        delegate_to: localhost
+
+      - name: 4. Start VMs
+        community.proxmox.proxmox_kvm:
+          api_user: "{{ proxmox_token_id.split('!')[0] }}"
+          api_token_id: "{{ proxmox_token_id.split('!')[1] }}"
+          api_token_secret: "{{ proxmox_token_secret }}"
+          api_host: "{{ ansible_host }}"
+          node: "{{ node }}"
+          vmid: "{{ item.vmid }}"
+          state: started
+        loop: "{{ vm_plan | from_json }}"
+        delegate_to: localhost
+
+      - name: 5. Wait for Initial Boot
+        ansible.builtin.pause:
+          seconds: 45
+
+      - name: "6. Discovery: MAC-to-IPv4 Extraction"
+        shell: |
+          VMID="{{ item.vmid | int }}"
+          TARGET_MAC=$(grep "net0" "/etc/pve/qemu-server/${VMID}.conf" | grep -oE "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}" | tr '[:upper:]' '[:lower:]')
+          for i in {2..254}; do ping -c 1 -W 0.1 {{ ip_subnet }}.$i >/dev/null 2>&1 & done; wait
+          RESULT_IP=$(ip neighbor show | tr '[:upper:]' '[:lower:]' | grep "$TARGET_MAC" | awk '{print $1}' | grep -v ":" | head -n 1)
+          if [ -n "$RESULT_IP" ]; then echo "$RESULT_IP"; exit 0; fi
+          exit 1
+        args:
+          executable: /bin/bash
+        loop: "{{ vm_plan | from_json }}"
+        register: discovered_ips
+        until: discovered_ips.rc == 0
+        retries: 25
+        delay: 5
+
+      - name: 7. Generate & Patch Configs
+        shell: |
+          FOLDER=~/talos-{{ next_id_result.json.data }}
+          mkdir -p $FOLDER
+          MASTER_IP="{{ discovered_ips.results[0].stdout }}"
+          talosctl gen config {{ cluster_name }} https://${MASTER_IP}:6443 --output-dir $FOLDER --force
+          sed -i 's/\/dev\/sda/\/dev\/vda/g' $FOLDER/*.yaml
+        delegate_to: localhost
+        run_once: true
+
+      - name: 8. Apply Configs to Nodes
+        shell: |
+          FOLDER=~/talos-{{ next_id_result.json.data }}
+          NODE_IP="{{ item.stdout }}"
+          ROLE="{{ 'controlplane' if item.item.role == 'controlplane' else 'worker' }}"
+          talosctl apply-config --insecure -n ${NODE_IP} -e ${NODE_IP} --file $FOLDER/${ROLE}.yaml
+        loop: "{{ discovered_ips.results }}"
+        delegate_to: localhost
+
+      - name: 9. Wait for API and PKI Settle
+        ansible.builtin.pause:
+          seconds: 40
+
+      - name: 10. Bootstrap Cluster
+        shell: |
+          FOLDER=~/talos-{{ next_id_result.json.data }}
+          MASTER_IP="{{ discovered_ips.results[0].stdout }}"
+          talosctl --talosconfig $FOLDER/talosconfig bootstrap -n ${MASTER_IP} -e ${MASTER_IP}
+        args:
+          executable: /bin/bash
+        delegate_to: localhost
+        run_once: true
+        register: bootstrap_result
+        until: bootstrap_result.rc == 0
+        retries: 20
+        delay: 10
+
+      - name: 11. Generate Kubeconfig Locally
+        shell: |
+          FOLDER=~/talos-{{ next_id_result.json.data }}
+          MASTER_IP="{{ discovered_ips.results[0].stdout }}"
+          talosctl --talosconfig $FOLDER/talosconfig kubeconfig $FOLDER/kubeconfig -n ${MASTER_IP} -e ${MASTER_IP} --force
+        delegate_to: localhost
+        run_once: true
