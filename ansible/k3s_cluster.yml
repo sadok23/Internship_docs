@@ -1,0 +1,268 @@
+# A linux clean linux template is required
+
+---
+# =======================================================================
+# PHASE 1: INFRASTRUCTURE PROVISIONING (PROXMOX API)
+# =======================================================================
+- name: "Infrastructure Provisioning"
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    node_count: 3
+    node_name: "pve"
+    template_id: 9000 
+    vm_prefix: "k3s-node"
+    vm_user: "ansible"
+    vm_cpu: 4
+    vm_ram: 8192
+    vm_disk: "30G"
+    domain: "astro.lan"
+
+  tasks:
+    - name: "1. API: Get Next Available VMID"
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:8006/api2/json/cluster/nextid"
+        method: GET
+        headers: { Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}" }
+        validate_certs: false
+      register: next_vmid_api
+      delegate_to: localhost
+
+    - name: "2. Set Starting VMID Fact"
+      ansible.builtin.set_fact:
+        start_id: "{{ next_vmid_api.json.data | int }}"
+
+    - name: "3. API: Clone VMs"
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ ansible_host }}"
+        api_user: "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id: "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node: "{{ node_name }}"
+        vmid: "{{ template_id }}"
+        clone: "{{ template_id }}"
+        newid: "{{ start_id | int + item | int }}"
+        name: "{{ vm_prefix }}-{{ start_id | int + item | int }}"
+        full: true
+        cores: "{{ vm_cpu }}"
+        memory: "{{ vm_ram }}"
+        agent: 1
+        state: present
+        timeout: 600
+      loop: "{{ range(0, node_count | int) | list }}"
+      loop_control:
+        pause: 5
+      delegate_to: localhost
+
+    - name: "4. API: Resize Disk to {{ vm_disk }}"
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:8006/api2/json/nodes/{{ node_name }}/qemu/{{ start_id | int + item | int }}/resize"
+        method: PUT
+        headers: { Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}" }
+        body_format: json
+        body:
+          disk: "scsi0"
+          size: "{{ vm_disk }}"
+        validate_certs: false
+      loop: "{{ range(0, node_count | int) | list }}"
+      delegate_to: localhost
+
+    - name: "5. API: Start VMs"
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ ansible_host }}"
+        api_user: "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id: "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node: "{{ node_name }}"
+        vmid: "{{ start_id | int + item | int }}"
+        state: started
+      loop: "{{ range(0, node_count | int) | list }}"
+      delegate_to: localhost
+
+    - name: "6. API: Inject Identity & Sudoers"
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:8006/api2/json/nodes/{{ node_name }}/qemu/{{ start_id | int + item }}/agent/exec"
+        method: POST
+        headers: { Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}" }
+        body_format: json
+        body:
+          command: 
+            - "bash"
+            - "-c"
+            - |
+              echo '{{ vm_prefix }}-{{ start_id | int + item }}' > /etc/hostname
+              useradd -m -s /bin/bash {{ vm_user }} || true
+              mkdir -p /home/{{ vm_user }}/.ssh
+              echo '{{ lookup('file', '~/.ssh/id_rsa.pub') }}' > /home/{{ vm_user }}/.ssh/authorized_keys
+              chown -R {{ vm_user }}:{{ vm_user }} /home/{{ vm_user }}/.ssh
+              echo '{{ vm_user }} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ansible
+              chmod 440 /etc/sudoers.d/ansible
+              truncate -s 0 /etc/machine-id
+              reboot
+        validate_certs: false
+      register: agent_res
+      until: agent_res.status == 200
+      retries: 50
+      delay: 5
+      loop: "{{ range(0, node_count | int) | list }}"
+      delegate_to: localhost
+
+    - name: "7. Wait for Reboot"
+      ansible.builtin.pause:
+        seconds: 45
+
+    - name: "8. API: Discover IP Addresses"
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:8006/api2/json/nodes/{{ node_name }}/qemu/{{ start_id | int + item }}/agent/network-get-interfaces"
+        method: GET
+        headers: { Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}" }
+        validate_certs: false
+      register: vm_interfaces_api
+      until: "vm_interfaces_api.json.data.result | selectattr('name', 'ne', 'lo') | map(attribute='ip-addresses') | flatten | select('search', '20\\.0\\.0\\.') | list | length > 0"
+      retries: 50
+      delay: 5
+      loop: "{{ range(0, node_count | int) | list }}"
+      delegate_to: localhost
+
+    - name: "9. Inventory Assignment"
+      ansible.builtin.add_host:
+        name: "{{ vm_prefix }}-{{ start_id | int + item.item }}"
+        ansible_host: "{{ (item.json.data.result | selectattr('name', 'ne', 'lo') | map(attribute='ip-addresses') | flatten | select('search', '20\\.0\\.0\\.') | first)['ip-address'] }}"
+        groups: ["k3s_nodes", "{{ 'k3s_master' if idx == 0 else 'k3s_workers' }}"]
+        ansible_user: "{{ vm_user }}"
+        cluster_id_tag: "{{ start_id }}"
+        domain_name: "{{ domain }}"
+      loop: "{{ vm_interfaces_api.results }}"
+      loop_control: { index_var: idx }
+      delegate_to: localhost
+
+# =======================================================================
+# PHASE 2: K3S & SOFTWARE STACK
+# =======================================================================
+- name: "K3s Cluster & Software Stack"
+  hosts: k3s_nodes
+  gather_facts: false
+  become: true
+  vars:
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+    kube_env: { KUBECONFIG: "/etc/rancher/k3s/k3s.yaml" }
+  tasks:
+    - name: "10. Wait for SSH"
+      ansible.builtin.wait_for_connection:
+        timeout: 180
+
+    - name: "11. Expand Disk — Detect & Grow All Partitions and Filesystems"
+      ansible.builtin.shell: |
+        set -e
+        ROOT_DISK=$(lsblk -ndo PKNAME $(findmnt -n -o SOURCE /) 2>/dev/null || echo "")
+        if [ -z "$ROOT_DISK" ]; then
+          if [ -b /dev/vda ]; then ROOT_DISK="vda"
+          elif [ -b /dev/sda ]; then ROOT_DISK="sda"
+          else echo "ERROR: cannot detect root disk" && exit 1
+          fi
+        fi
+        growpart /dev/$ROOT_DISK 3 || true
+        pvresize /dev/${ROOT_DISK}3 || true
+        LV_PATH=$(lvdisplay | awk '/LV Path/{print $3}' | head -1)
+        if [ -n "$LV_PATH" ]; then
+          lvextend -l +100%FREE "$LV_PATH" || true
+          resize2fs "$LV_PATH" 2>/dev/null || xfs_growfs "$LV_PATH" 2>/dev/null || true
+        fi
+        df -h /
+      changed_when: false
+
+    - name: "12. Install K3s Master"
+      ansible.builtin.shell: "curl -sfL https://get.k3s.io | sh -s - server --disable traefik"
+      when: "'k3s_master' in group_names"
+      args: { creates: /etc/rancher/k3s/k3s.yaml }
+
+    - name: "13. Fix Kubeconfig Permissions"
+      ansible.builtin.shell: |
+        chmod 644 /etc/rancher/k3s/k3s.yaml
+        grep -q "KUBECONFIG" /home/{{ ansible_user }}/.bashrc || echo "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> /home/{{ ansible_user }}/.bashrc
+      when: "'k3s_master' in group_names"
+
+    - name: "14. Join Worker Nodes"
+      vars:
+        master_ip: "{{ hostvars[groups['k3s_master'][0]].ansible_host }}"
+      block:
+        - name: "Get Token"
+          ansible.builtin.shell: "cat /var/lib/rancher/k3s/server/node-token"
+          register: k3s_token
+          delegate_to: "{{ groups['k3s_master'][0] }}"
+        - name: "Install & Join"
+          ansible.builtin.shell: "curl -sfL https://get.k3s.io | K3S_URL='https://{{ master_ip }}:6443' K3S_TOKEN='{{ k3s_token.stdout }}' sh -"
+          when: "'k3s_workers' in group_names"
+
+    - name: "15. Install Helm & System Dependencies"
+      ansible.builtin.shell: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        apt-get update && apt-get install -y open-iscsi nfs-common jq
+      when: "'k3s_master' in group_names"
+
+    - name: "16. Add Helm Repos"
+      ansible.builtin.shell: |
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+        helm repo add jetstack https://charts.jetstack.io
+        helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
+        helm repo update
+      environment: "{{ kube_env }}"
+      when: "'k3s_master' in group_names"
+
+    - name: "17. Install ingress-nginx"
+      ansible.builtin.shell: |
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+          --namespace ingress-nginx --create-namespace
+      environment: "{{ kube_env }}"
+      when: "'k3s_master' in group_names"
+
+    - name: "18. Wait for ingress-nginx Controller & Admission Webhook"
+      ansible.builtin.shell: |
+        kubectl rollout status deployment/ingress-nginx-controller \
+          -n ingress-nginx --timeout=300s
+        kubectl wait --namespace ingress-nginx \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/component=controller \
+          --timeout=300s
+      environment: "{{ kube_env }}"
+      when: "'k3s_master' in group_names"
+
+    - name: "19. Install cert-manager"
+      ansible.builtin.shell: |
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager --create-namespace \
+          --set installCRDs=true
+      environment: "{{ kube_env }}"
+      when: "'k3s_master' in group_names"
+
+    - name: "20. Set Unique Rancher Hostname Fact"
+      ansible.builtin.set_fact:
+        rancher_hostname: "rancher-{{ cluster_id_tag }}.{{ domain_name }}"
+      when: "'k3s_master' in group_names"
+
+    - name: "21. Deploy Rancher (NodePort 30443)"
+      ansible.builtin.shell: |
+        helm upgrade --install rancher rancher-latest/rancher \
+          -n cattle-system --create-namespace \
+          --set hostname={{ rancher_hostname }} \
+          --set bootstrapPassword=admin \
+          --set replicas=1 \
+          --set ingress.ingressClassName=nginx \
+          --set service.type=NodePort \
+          --set service.nodePort=30443
+      environment: "{{ kube_env }}"
+      when: "'k3s_master' in group_names"
+
+    - name: "22. Final Access Summary"
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "         CLUSTER DEPLOYMENT COMPLETE        "
+          - "============================================"
+          - "Master IP    : {{ ansible_host }}"
+          - "Cluster ID   : {{ cluster_id_tag }}"
+          - "--------------------------------------------"
+          - "Rancher URL  : https://{{ ansible_host }}:30443"
+          - "Rancher Host : {{ rancher_hostname }}"
+          - "============================================"
+      when: "'k3s_master' in group_names"
