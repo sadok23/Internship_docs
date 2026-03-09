@@ -62,40 +62,21 @@ Backup Client #1         Backup Client #2         Backup Client #3
                     ║ └─────────────────────┘  ║
                     ╚══════════════════════════╝
                             │
-                    ┌───────▼────────┐
-                    │  bbs-data      │
-                    │  Docker Volume │
-                    │  or Bind Mount │
-                    └────────────────┘
+                  ┌─────────▼──────────┐
+                  │ TrueNAS (20.0.0.109)
+                  │ /mnt/disk-1 (NFS)  │
+                  └────────────────────┘
 ```
 
 ---
 
-## Quick Start
 
-```bash
-# Start the container
-docker compose up -d
-
-# View admin credentials (generated on first run)
-docker compose logs bbs | grep -i "admin\|password"
-
-# Access the web UI
-# Navigate to http://localhost:8080 in your browser
-```
-
----
 
 ## 1. Docker Compose Deployment
 
-### Prerequisites
-- Docker and Docker Compose installed
-- At least 1GB storage available for backups
-- Network access to SSH port 2222 from backup clients
 
 ### Docker Compose File
 
-Save this as `docker-compose.yml`:
 
 ```yaml
 # Borg Backup Server — Docker Compose
@@ -132,45 +113,7 @@ volumes:
   bbs-data: # Remove this 'volumes' section entirely if using a bind mount above
 ```
 
-### Deployment Steps
 
-1. **Create project directory:**
-```bash
-mkdir -p /opt/borg-backup
-cd /opt/borg-backup
-```
-
-2. **Create docker-compose.yml** with the configuration above
-
-3. **Start the service:**
-```bash
-docker compose up -d
-```
-
-4. **Verify it's running:**
-```bash
-docker compose ps
-```
-
-### Using Bind Mount for Large Storage
-
-If storing backups on a dedicated disk, modify the `docker-compose.yml`:
-
-```yaml
-volumes:
-  bbs:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /mnt/backups  # Change to your mount point
-```
-
-Then update the service volume:
-```yaml
-volumes:
-  - bbs:/var/bbs
-```
 
 ### Using TrueNAS NFS for Centralized Storage
 
@@ -192,15 +135,7 @@ For production environments with dedicated storage appliances, using **TrueNAS**
 
 **Install NFS client tools:**
 ```bash
-# Debian/Ubuntu
 sudo apt-get install nfs-common
-
-# RHEL/CentOS
-sudo dnf install nfs-utils
-
-# Arch
-sudo pacman -S nfs-utils
-```
 
 **Create mount directory:**
 ```bash
@@ -256,41 +191,7 @@ services:
 - Easy capacity expansion
 - Network-based so independent from host hardware
 
-#### Example: Multi-Server Backup Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│              TrueNAS Storage (20.0.0.109)               │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  NFS Share: /mnt/disk-1                          │   │
-│  │  ├─ ZFS Dataset (disk-1)                         │   │
-│  │  │  └─ NFS Export: /mnt/disk-1                  │   │
-│  │  │     ├─ RAID-Z2 (3+ drives)                   │   │
-│  │  │     └─ Daily snapshots enabled                │   │
-│  └──────────────────────────────────────────────────┘   │
-└────────┬──────────────────────────────────────────────────┘
-         │
-         │ NFS (Port 2049)
-         │ 20.0.0.109:/mnt/disk-1
-         │
-    ┌────┴────────────────────────────┐
-    │                                 │
-┌───▼────────────────────┐   ┌────────▼──────────────┐
-│ BBS Server             │   │ Other Servers        │
-│ (Backup Host)          │   │ (can also access     │
-│ ┌────────────────────┐ │   │  backups via NFS)    │
-│ │ /mnt/borg-backups  │ │   └──────────────────────┘
-│ │ (NFS mount)        │ │
-│ │                    │ │
-│ │ Docker Container   │ │
-│ │ Borg Backup Server │ │
-│ │ :8080 (Web UI)     │ │
-│ │ :2222 (SSH)        │ │
-│ └────────────────────┘ │
-└────────────────────────┘
-```
-
----
 
 ## 2. Configuration
 
@@ -307,7 +208,7 @@ services:
 **APP_URL:** Must be accessible from both your browser and backup clients
 ```yaml
 environment:
-  - APP_URL=http://192.168.1.100:8080  # Use your server's IP for remote access
+  - APP_URL=http:/<host-ip>:8080  # Use your server's IP for remote access
 ```
 
 **SSH_PORT:** Must match the left side of the port mapping
@@ -328,267 +229,73 @@ volumes:
 
 ## 3. Web UI & Admin
 
-### Accessing the Web Interface
+### Quick Access
+- URL: `http://<host-ip>:8080` (or your configured APP_URL)
+- Default login: **admin** / **password** (the generated password could be found in the container logs)
 
-1. Navigate to `http://localhost:8080` (or your configured APP_URL)
-2. Login with **admin** / **password** from logs
-3. Change the default password immediately
+### Creating a Backup Plan
 
-### Admin Tasks
+#### Step 0: Add Storage Location
 
-#### Creating Users
-1. Go to **Administration** → **Users**
-2. Click **Create New User**
-3. Set username and password
-4. Configure permissions (optional)
+1. **Left menu** → **Storage**
+2. Click **Add Location**
+3. Select the NFS volume mounted from TrueNAS (`/mnt/borg-backups`)
+4. Click **Save**
 
-#### Creating Repositories
-1. Go to **Repositories** → **New Repository**
-2. Set repository name (e.g., `client1-backup`)
-3. Configure retention policies
-4. Generate SSH keys for client access
+#### Step 1: Add a Client
 
-#### Viewing Backups & Archives
-1. Go to **Repositories** → Select repository
-2. View archive list (each backup is an archive)
-3. Check file list, timestamps, and sizes per backup
-4. Browse and restore individual files if needed
+1. **Left dashboard** → **Clients**
+2. Click **Add Client**
+3. Enter client name (e.g., `server1`, `webhost-prod`)
+4. Click **Create Client**
+5. Copy the provided installation command and run it on the remote host:
+   ```bash
+   curl -s http://20.0.0.98:8080/get-agent | sudo bash -s -- --server http://20.0.0.98:8080 --key xxxxx-xxxxxx-xxxxxxx-xxxxxxxx
+   ```
+6. The agent will register itself and connect back to the server
 
----
+#### Step 2: Configure Repository & Backup Plan
 
-## 4. Backup Clients Setup
+After the client connects, select it from the **Clients** list:
 
-### Prerequisites on Client
-- **Borg Backup CLI** installed
-  ```bash
-  sudo apt-get install borgbackup  # Debian/Ubuntu
-  sudo dnf install borgbackup      # RHEL/CentOS
-  sudo pacman -S borg              # Arch
-  ```
-- SSH key-based authentication configured
-- Network connectivity to BBS server
+**Add Repository:**
+- Click **Repositories** window
+- Click **Add Repository**
+- A **repository** is a backup destination specific to this client (like a backup vault)
+- Repository naming: `{client-name}-backup` (e.g., `server1-backup`)
 
-### Client Registration Workflow
+**Add Backup Plan:**
+- Click **Plans** window  
+- Click **Add Backup Plan**
+- Configure the following:
 
-1. **Create a repository in BBS Web UI** and note the SSH connection string
-   - Format: `ssh://borg@server:2222/path/to/repo`
+| Setting | Options | Recommendation |
+|---------|---------|-----------------|
+| **Schedule** | Daily, Weekly, Monthly, Custom | Daily at 2:00 AM |
+| **Folders to Backup** | Select multiple paths | `/etc`, `/home`, `/var/www`, etc. |
+| **Compression** | None, LZ4, ZSTD, Auto | ZSTD (balanced speed/compression) |
+| **Encryption** | Enabled by default | Keep enabled ✓ |
+| **Retention** | Keep X daily/weekly/monthly | 7 daily, 4 weekly, 12 monthly |
 
-2. **On the client, initialize the backup:**
-```bash
-# First connection creates SSH key exchange
-borg init --encryption=repokey ssh://borg@192.168.1.100:2222/backup/client1
+4. Click **Save Plan** to activate automatic backups
 
-# Enter passphrase when prompted
-# Accept the remote host key
+#### Step 3: Restore Data
+
+Select the client and go to **Restore** window:
+
+**Option 1: Restore to Host**
+- Select backup snapshot
+- Choose destination path on the client
+- Click **Restore** (files will be recovered on the client machine)
+
+**Option 2: Download**
+- Select backup snapshot
+- Choose files/folders to download
+- Click **Download** (files downloaded to your local machine)
+
+
 ```
 
-3. **Create your first backup:**
-```bash
-borg create \
-  ssh://borg@192.168.1.100:2222/backup/client1::'hostname-{now:%Y-%m-%d_%H:%M:%S}' \
-  /etc /home /var/www \
-  --stats --progress
-```
 
-### Automated Backups with Cron
 
-Create `/etc/cron.d/borg-backup`:
 
-```bash
-# Borg Backup - Daily at 2 AM
-0 2 * * * root /usr/local/bin/borg-backup.sh >> /var/log/borg-backup.log 2>&1
-```
-
-Create `/usr/local/bin/borg-backup.sh`:
-
-```bash
-#!/bin/bash
-
-REPO="ssh://borg@192.168.1.100:2222/backup/client1"
-BACKUP_DIRS="/etc /home /var/www"
-PASSPHRASE="YourPassphrase"
-
-export BORG_PASSPHRASE=$PASSPHRASE
-
-# Create backup
-borg create \
-  ${REPO}::'hostname-{now:%Y-%m-%d}' \
-  ${BACKUP_DIRS} \
-  --stats
-
-# Prune old backups (keep last 7 daily, 4 weekly, 12 monthly)
-borg prune \
-  --keep-daily=7 \
-  --keep-weekly=4 \
-  --keep-monthly=12 \
-  ${REPO}
-
-exit 0
-```
-
-Make it executable:
-```bash
-chmod +x /usr/local/bin/borg-backup.sh
-```
-
-### Listing & Restoring Backups
-
-```bash
-# List all backups
-borg list ssh://borg@192.168.1.100:2222/backup/client1
-
-# List files in specific backup
-borg list ssh://borg@192.168.1.100:2222/backup/client1::hostname-2026-03-09
-
-# Extract entire backup to /tmp/restore
-borg extract ssh://borg@192.168.1.100:2222/backup/client1::hostname-2026-03-09 --path=/tmp/restore
-
-# Extract specific file
-borg extract ssh://borg@192.168.1.100:2222/backup/client1::hostname-2026-03-09 etc/passwd
-```
-
----
-
-## 5. Repository Management
-
-### Repository Info
-
-```bash
-# Get repository statistics
-borg info ssh://borg@192.168.1.100:2222/backup/client1
-
-# Output includes:
-# - Total data size
-# - Compressed size (after deduplication)
-# - Number of archives
-# - Encryption method
-```
-
-### Pruning Old Backups
-
-Keep only recent backups to save space:
-
-```bash
-# Keep: 7 days, 4 weeks, 12 months
-borg prune \
-  --keep-daily=7 \
-  --keep-weekly=4 \
-  --keep-monthly=12 \
-  ssh://borg@192.168.1.100:2222/backup/client1 \
-  --stats
-```
-
-### Encryption & Security
-
-**Default:** `repokey-blake2` encryption
-- Encryption key stored in repository
-- You must remember the passphrase
-
-**Change passphrase:**
-```bash
-borg key change-passphrase ssh://borg@192.168.1.100:2222/backup/client1
-```
-
-**Export key for backup:**
-```bash
-borg key export ssh://borg@192.168.1.100:2222/backup/client1 /tmp/borg-key.txt
-```
-
----
-
-## 6. Monitoring & Maintenance
-
-### Container Logs
-
-```bash
-# View all logs
-docker compose logs bbs
-
-# Follow logs in real-time
-docker compose logs -f bbs
-
-# View last 100 lines
-docker compose logs --tail=100 bbs
-```
-
-### Database Backup
-
-The MySQL database (containing backup metadata) is stored in the `bbs-data` volume:
-
-```bash
-# Backup the entire bbs-data volume
-docker run --rm \
-  -v bbs-data:/bbs-data \
-  -v $(pwd):/backup \
-  ubuntu tar czf /backup/bbs-data-backup.tar.gz -C /bbs-data .
-
-# Restore from backup
-docker run --rm \
-  -v bbs-data:/bbs-data \
-  -v $(pwd):/backup \
-  ubuntu tar xzf /backup/bbs-data-backup.tar.gz -C /bbs-data
-```
-
-### Updating BBS
-
-```bash
-# Pull latest image
-docker compose pull
-
-# Restart with new image
-docker compose up -d
-
-# Verify update
-docker compose logs bbs | head -20
-```
-
-### Monitoring Backup Success
-
-Check the web UI or use the API:
-
-```bash
-# Query repository status via SSH
-borg list ssh://borg@192.168.1.100:2222/backup/client1 --short
-```
-
-Set up Prometheus scrapes or log aggregation for production monitoring.
-
----
-
-## Troubleshooting
-
-### Connection Issues
-```bash
-# Test SSH connectivity
-ssh -p 2222 borg@192.168.1.100
-
-# Check SSH key fingerprint in logs
-docker compose logs bbs | grep -i "key\|rsa"
-```
-
-### Passphrase/Access Issues
-- If passphrase is forgotten, backups cannot be accessed
-- Keep encrypted backup of passphrases in secure location
-- Consider using key-file mode for automated backups
-
-### Storage Issues
-```bash
-# Check volume usage
-docker exec bbs du -sh /var/bbs
-
-# Prune old backups to free space
-borg prune --keep-daily=3 ssh://borg@192.168.1.100:2222/backup/client1
-```
-
-### Backup Failures
-1. Check client connectivity: `ssh -p 2222 borg@server`
-2. Verify repository path exists in BBS Web UI
-3. Check client firewall (allow port 2222)
-4. Review BBS container logs for SSH errors
-
----
-
-## References
-- [Borg Backup Documentation](https://borgbackup.readthedocs.io/)
-- [Borg Backup Server GitHub](https://github.com/marcpope/borgbackupserver)
-- [Docker Compose Documentation](https://docs.docker.com/compose/)
