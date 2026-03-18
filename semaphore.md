@@ -1,6 +1,6 @@
 # Semaphore — Installation & Usage Guide
 
-> Ansible automation UI powered by Semaphore, running on Docker with PostgreSQL.
+> Ansible automation UI running on Docker with PostgreSQL, connected to Proxmox for VM provisioning.
 
 ---
 
@@ -9,14 +9,14 @@
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [First Login](#first-login)
+- [Proxmox API Token](#proxmox-api-token)
+- [Install community.general in Semaphore](#install-communitygeneral-in-semaphore)
 - [Project Setup](#project-setup)
-  - [1. Key Store](#1-key-store)
-  - [2. Repository](#2-repository)
-  - [3. Inventory](#3-inventory)
-  - [4. Environment](#4-environment)
-  - [5. Task Template](#5-task-template)
-- [Running the Dockhand Provisioning Playbook](#running-the-dockhand-provisioning-playbook)
-- [Folder Structure](#folder-structure)
+  - [1. Repository](#1-repository)
+  - [2. Inventory](#2-inventory)
+  - [3. Variable Group](#3-variable-group)
+  - [4. Task Template](#4-task-template)
+- [Running the Playbook](#running-the-playbook)
 - [Useful Commands](#useful-commands)
 
 ---
@@ -24,8 +24,8 @@
 ## Prerequisites
 
 - Docker and Docker Compose installed
-- A machine accessible on your network
-- Your Ansible playbooks stored locally or in a Git repository
+- A Proxmox host accessible on your network
+- Your playbooks stored in a GitHub repository
 
 ---
 
@@ -34,11 +34,11 @@
 ### 1. Create the project directory
 
 ```bash
-mkdir -p ~/semaphore/playbooks
+mkdir -p ~/semaphore
 cd ~/semaphore
 ```
 
-### 2. Create the `docker-compose.yml`
+### 2. Create `docker-compose.yml`
 
 ```yaml
 services:
@@ -74,7 +74,6 @@ services:
     depends_on:
       - semaphore-db
     volumes:
-      - ./playbooks:/tmp/semaphore/playbooks
       - semaphore-config:/etc/semaphore
 
 volumes:
@@ -88,15 +87,7 @@ volumes:
 docker compose up -d
 ```
 
-### 4. Verify containers are running
-
-```bash
-docker ps
-```
-
-Both `semaphore` and `semaphore-db` should show as `Up`.
-
-Semaphore is now accessible at:
+Semaphore will be available at:
 
 ```
 http://<your-server-ip>:3001
@@ -106,101 +97,149 @@ http://<your-server-ip>:3001
 
 ## First Login
 
-| Field    | Value              |
-|----------|--------------------|
-| Username | `admin`            |
-| Password | `admin`            |
+| Field    | Value   |
+|----------|---------|
+| Username | `admin` |
+| Password | `admin` |
 
-> ⚠️ Change the admin password immediately after first login via **Team → Edit User**.
+> ⚠️ Change the admin password after first login via **Team → Edit User**.
+
+---
+
+## Proxmox API Token
+
+Semaphore communicates with Proxmox through an API token. Here is how to create one with the right permissions.
+
+### 1. Create the token
+
+In the Proxmox web UI go to **Datacenter → Permissions → API Tokens → Add**.
+
+| Field | Value |
+|-------|-------|
+| User | `root@pam` |
+| Token ID | `ansible` |
+| Privilege Separation | **Unchecked** |
+
+> Unchecking **Privilege Separation** means the token inherits root permissions. This is required for VM cloning, cloud-init configuration, and starting VMs.
+
+Click **Add** and copy the token secret — it is only shown once.
+
+Your token will look like this:
+
+```
+Token ID:     root@pam!ansible
+Token Secret: d12ac917-dc0f-4ccb-ae8b-76f43476bbd4
+```
+
+### 2. Verify permissions
+
+Since `root@pam` with privilege separation disabled inherits full permissions, no additional role assignment is needed. If you use a non-root user you would need to assign at minimum the `PVEAdmin` role at the Datacenter level.
+
+---
+
+## Install community.general in Semaphore
+
+The provisioning playbook uses `community.general.proxmox_kvm` which is not included in the default Ansible installation inside the Semaphore container. You need to install it manually into the Ansible virtual environment.
+
+### 1. Exec into the container
+
+```bash
+docker exec -it semaphore /bin/sh
+```
+
+### 2. Find the Ansible venv
+
+```bash
+find / -name "ansible" -type f 2>/dev/null | grep bin
+```
+
+It will typically be at `/usr/lib/python3/dist-packages/` or inside a venv like `/usr/local/lib/python3.x/`.
+
+### 3. Install the collection
+
+```bash
+ansible-galaxy collection install community.general
+```
+
+### 4. Verify
+
+```bash
+ansible-galaxy collection list | grep community.general
+```
+
+### 5. Exit the container
+
+```bash
+exit
+```
+
+> This installation persists as long as the container is not recreated. If you run `docker compose down && docker compose up`, you will need to repeat this step — or mount a persistent volume for the Ansible collections directory.
 
 ---
 
 ## Project Setup
 
-Everything in Semaphore lives inside a **Project**. Before you can run a playbook you need to configure five things in order.
+In Semaphore, create a new **Project** first. Everything below lives inside it.
 
-### 1. Key Store
-
-The Key Store holds credentials used by Ansible — SSH keys, passwords, and API tokens.
-
-**Navigate to:** Project → Key Store → `+ New Key`
-
-#### SSH Key (for connecting to VMs)
-
-| Field | Value |
-|-------|-------|
-| Name | `vm-ssh-key` |
-| Type | `SSH Key` |
-| Private Key | Paste your private key |
-
-#### Proxmox API Token (for the provisioning playbook)
-
-| Field | Value |
-|-------|-------|
-| Name | `proxmox-token` |
-| Type | `Login with password` |
-| Login | `user@pve!tokenid` |
-| Password | `your-token-secret` |
-
-> The playbook reads `proxmox_token_id` and `proxmox_token_secret` from the inventory. See [Inventory](#3-inventory) below.
+**Navigate to:** `Projects → + New Project` → give it a name like `Proxmox Provisioning`.
 
 ---
 
-### 2. Repository
+### 1. Repository
 
-The Repository tells Semaphore where your playbooks live. Since playbooks are mounted directly into the container at `/tmp/semaphore/playbooks`, you can use a **local path** without needing Git.
+The Repository connects Semaphore to your GitHub repo where the playbooks live.
 
 **Navigate to:** Project → Repositories → `+ New Repository`
 
 | Field | Value |
 |-------|-------|
-| Name | `local-playbooks` |
-| URL | `/tmp/semaphore/playbooks` |
-| Branch | `main` *(ignored for local paths)* |
-| Access Key | `None` |
-
-> If you prefer Git, set the URL to your repo URL and select the appropriate SSH or token key.
+| Name | `provisioning-playbooks` |
+| URL | `https://github.com/<your-username>/<your-repo>` |
+| Branch | `main` |
+| Access Key | None *(for public repos)* or a GitHub token key for private repos |
 
 ---
 
-### 3. Inventory
+### 2. Inventory
 
-The Inventory defines the target hosts and variables Ansible will use.
+The Inventory defines your Proxmox host and the API credentials Ansible uses to talk to it.
 
 **Navigate to:** Project → Inventory → `+ New Inventory`
 
 | Field | Value |
 |-------|-------|
-| Name | `proxmox-hosts` |
-| Type | `Static` |
-| SSH Key | `vm-ssh-key` |
+| Name | `proxmox` |
+| Type | `YAML` |
+| SSH Key | None |
 
 **Inventory content:**
 
-```ini
-[proxmox]
-<your-proxmox-ip> ansible_user=root
-
-[proxmox:vars]
-proxmox_token_id=user@pve!tokenid
-proxmox_token_secret=your-token-secret
+```yaml
+all:
+  hosts:
+    proxmox:
+      ansible_host: 20.0.0.202
+      ansible_user: root
+      pve_api_user: root@pam
+      proxmox_token_id: "root@pam!ansible"
+      proxmox_token_secret: d12ac917-dc0f-4ccb-ae8b-76f43476bbd4
 ```
 
-Replace `<your-proxmox-ip>`, `proxmox_token_id`, and `proxmox_token_secret` with your actual values.
+Replace `ansible_host` with your Proxmox IP and the token values with your own.
 
 ---
 
-### 4. Environment
+### 3. Variable Group
 
-The Environment holds extra variables passed to the playbook at runtime. This is where you set the per-run values like the VM name and admin IP.
+The Variable Group holds the per-run variables passed to the playbook as extra vars. This is where you configure what VM gets created.
 
-**Navigate to:** Project → Environment → `+ New Environment`
+**Navigate to:** Project → Variable Groups → `+ New Variable Group`
 
 | Field | Value |
 |-------|-------|
 | Name | `dockhand-vars` |
 
-**Extra variables (JSON):**
+**Variables (JSON):**
 
 ```json
 {
@@ -211,13 +250,20 @@ The Environment holds extra variables passed to the playbook at runtime. This is
 }
 ```
 
-> `ssh_ip` must be the IP of the machine you will SSH from after provisioning. This is the only IP that will be allowed through UFW after the playbook completes.
+| Variable | Description |
+|----------|-------------|
+| `new_vm_name` | Base name for the VM — VMID is appended automatically |
+| `vm_user` | User created on the VM via cloud-init |
+| `vm_password` | Password for that user |
+| `ssh_ip` | The only IP that will be allowed to SSH into the VM after provisioning |
+
+> `ssh_ip` is critical — once the playbook finishes, UFW locks SSH to this IP only.
 
 ---
 
-### 5. Task Template
+### 4. Task Template
 
-The Task Template ties everything together — it defines which playbook to run and with which inventory, environment, and repository.
+The Task Template ties everything together.
 
 **Navigate to:** Project → Task Templates → `+ New Template`
 
@@ -225,61 +271,35 @@ The Task Template ties everything together — it defines which playbook to run 
 |-------|-------|
 | Name | `Provision Dockhand VM` |
 | Playbook Filename | `provision_dockhand.yml` |
-| Inventory | `proxmox-hosts` |
-| Repository | `local-playbooks` |
-| Environment | `dockhand-vars` |
-| Vault Password | *(leave empty unless using Ansible Vault)* |
+| Inventory | `proxmox` |
+| Repository | `provisioning-playbooks` |
+| Variable Group | `dockhand-vars` |
 
 ---
 
-## Running the Dockhand Provisioning Playbook
-
-### Place the playbook
-
-Copy `provision_dockhand.yml` into the `playbooks` folder on your server:
-
-```bash
-cp provision_dockhand.yml ~/semaphore/playbooks/
-```
-
-The file is immediately available inside the container at `/tmp/semaphore/playbooks/provision_dockhand.yml`.
-
-### Run the task
+## Running the Playbook
 
 1. Navigate to **Task Templates**
 2. Click **Run** on `Provision Dockhand VM`
-3. Optionally override any extra variables for this specific run (e.g. change `new_vm_name`)
+3. Optionally override variable group values for this specific run (e.g. different `new_vm_name` or `ssh_ip`)
 4. Click **Confirm**
 
-### What happens
+Semaphore streams the full Ansible output in real time under the **Tasks** tab.
 
-| Step | What Semaphore / Ansible does |
-|------|-------------------------------|
+### What the playbook does
+
+| Steps | Action |
+|-------|--------|
 | 1–2 | Gets next available VMID from Proxmox API |
-| 3 | Clones template `102` into a new VM named `<new_vm_name>-<vmid>` |
-| 4 | Sets cloud-init credentials and DHCP |
-| 5 | Starts the VM, waits for cloud-init to finish |
-| 6 | Creates user, enables SSH password auth, reboots |
-| 7–9 | Discovers VM IP via QEMU guest agent |
-| 10–15 | SSHes into the VM, installs Docker, Traefik, Dockhand, configures UFW |
-| 18 | Locks SSH access to `ssh_ip` only |
+| 3 | Clones the template into a new VM named `<new_vm_name>-<vmid>` |
+| 4 | Applies cloud-init credentials and DHCP |
+| 5–5b | Starts the VM, waits for cloud-init to complete |
+| 6–7 | Configures user, enables SSH password auth, reboots |
+| 8–9 | Discovers the VM IP via QEMU guest agent |
+| 10–15 | SSHes in, installs Docker, Traefik, Dockhand, configures UFW |
+| 18 | Locks SSH to `ssh_ip` only |
 
-### Monitor the run
-
-Semaphore streams the full Ansible output in real time under the **Tasks** tab. Each task is numbered and matches the playbook task names.
-
-> To increase verbosity, add `-vvv` to **Extra CLI Arguments** in the Task Template settings.
-
----
-
-## Folder Structure
-
-```
-~/semaphore/
-├── docker-compose.yml
-└── playbooks/
-    └── provision_dockhand.yml
-```
+> To increase verbosity add `-vvv` to **Extra CLI Arguments** in the Task Template settings.
 
 ---
 
@@ -295,13 +315,12 @@ docker compose down
 # View logs
 docker logs semaphore
 
-# Restart only Semaphore (keep DB running)
+# Restart Semaphore only
 docker compose restart semaphore
 
 # Update to latest image
 docker compose pull && docker compose up -d
+
+# Exec into container (e.g. to install collections)
+docker exec -it semaphore /bin/sh
 ```
-
----
-
-> For issues with playbook execution, check the task log in Semaphore first. Common causes are incorrect Proxmox token permissions, wrong `ssh_ip`, or the template VMID not matching `template_id` in the playbook vars.
