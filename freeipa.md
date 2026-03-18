@@ -4,7 +4,7 @@
 
 ## 1. FreeIPA Server
 
-Deployed as a Docker container using the official `freeipa/freeipa-server:almalinux-10` image.
+FreeIPA is a full identity management stack — it bundles a **389 Directory Server** (LDAP), **MIT Kerberos**, and a **PKI/CA** into a single container. That's why `--privileged` is mandatory: it needs real kernel-level access that normal containers don't get.
 
 ```bash
 sudo docker run -it \
@@ -31,17 +31,16 @@ sudo docker run -it \
     --no-ntp
 ```
 
-- `--privileged` is required because FreeIPA needs access to system-level kernel features (e.g. systemd, network namespaces).
-- `/opt/freeipa-data` is mounted to persist all FreeIPA data (LDAP database, certs, Kerberos keytabs) across container restarts.
-- `--no-ntp` disables the built-in NTP setup since the host already manages time sync.
-- Ports `88` and `464` (both TCP and UDP) are for Kerberos authentication and password change operations.
-- The Kerberos realm `ASTEROIDEA.COM` must be uppercase by convention.
+- `--hostname ipa.asteroidea.com` — FreeIPA hardcodes this into every certificate and Kerberos principal it generates at install time. It must match what clients use to reach it, otherwise TLS and Kerberos break.
+- `-v /opt/freeipa-data:/data` — persists the entire identity server (LDAP database, CA, Kerberos keys) across container restarts. Without this, everything is wiped on restart.
+- `--no-ntp` — skips the built-in Chrony setup since the host manages time sync. Keep the host clock accurate — Kerberos has a 5-minute skew tolerance and hard-rejects auth if clocks drift.
+- Ports `88` and `464` (TCP + UDP) — Kerberos authentication and the `kpasswd` service. Both need TCP and UDP because Kerberos uses UDP for small packets and falls back to TCP for larger ones.
 
 ---
 
 ## 2. Self-Service Password Portal
 
-SSP allows users to reset their FreeIPA password via a web interface without admin intervention. It communicates with FreeIPA over LDAP and sends reset tokens by email through a Postfix relay.
+SSP allows users to reset their FreeIPA password via a web interface without admin intervention. It talks to FreeIPA over LDAP and sends reset tokens by email through a Postfix relay.
 
 ### docker-compose.yml
 
@@ -90,9 +89,9 @@ networks:
     external: true
 ```
 
-- The `ipa-net` network is declared as `external: true` — it must already exist on the host (`docker network create ipa-net`) and is shared with the `freeipa-server` container so that SSP can reach it by container name.
-- The environment variables in the SSP service are **overridden by the mounted PHP config file**. The PHP file is the actual source of truth for LDAP and mail settings.
-- `smtp-relay` acts as a local Postfix relay that forwards outbound emails to Gmail's SMTP server on port 587 using app credentials. SSP talks to it on port 25 with no authentication (internal network only).
+- `ipa-net: external: true` — this network must already exist on the host (`docker network create ipa-net`). It's shared with the `freeipa-server` container (started separately via `docker run`), which is what allows SSP to reach FreeIPA by container name.
+- The env vars on the SSP service (`LDAP_URL`, `LDAP_BINDDN`, etc.) are **overridden by the mounted PHP config file**. The file is the actual source of truth — the env vars are effectively dead in this setup.
+- `smtp-relay` is a Postfix container that relays outbound mail to Gmail on port 587. SSP sends to it on port 25 with no auth — safe because it's internal to the Docker network.
 
 ### config.inc.local.php
 
@@ -127,17 +126,14 @@ $smtp_debug = 4;
 ?>
 ```
 
-- `$ldap_url` uses the container name `freeipa-server` — this works because both containers are on the same `ipa-net` Docker network.
-- `$use_tokens = true` enables email-based reset tokens. The user receives a link, clicks it, and sets a new password without admin involvement.
-- `$keyphrase` is used to sign/encrypt the reset tokens. It must stay constant across container restarts.
-- `$smtp_debug = 4` logs full SMTP session output — useful during initial setup, should be set to `0` in production.
-- `$reset_url` and `$baseurl` must point to the externally reachable address of the SSP container so that token links in emails work correctly.
+- `ldap://freeipa-server:389` — uses the container name instead of an IP. Docker's internal DNS resolves it as long as both containers are on `ipa-net`. More reliable than a hardcoded IP which can change on restart.
+- `$use_tokens = true` + `$keyphrase` — SSP generates a one-time token, signs it with the keyphrase, and emails a reset link to the user. The keyphrase must stay constant across restarts — if it changes, any in-flight reset tokens become invalid.
+- `$reset_url` and `$baseurl` — must point to the externally reachable address of SSP so that the token links in emails actually work for the user clicking them.
+- `$smtp_debug = 4` — logs the full SMTP session to container logs. Useful during setup, set to `0` in production.
 
 ---
 
 ## 3. Proxmox LDAP Sync
-
-Proxmox supports LDAP-based authentication and user/group sync natively. Once configured, FreeIPA users can log into the Proxmox web UI using their LDAP credentials.
 
 Navigate to: **Datacenter → Realm → Add → LDAP**
 
@@ -155,7 +151,7 @@ Navigate to: **Datacenter → Realm → Add → LDAP**
 | Verify Certificate | `none` |
 | Require TFA | *(unchecked)* |
 
-> **Note:** The Server field must be resolvable from the Proxmox host. If DNS is not configured, use the host IP directly. Docker container names are not resolvable outside the Docker network.
+> **Note:** The Server field must be resolvable from the Proxmox host. If DNS isn't configured, use the host IP directly. Docker container names are not resolvable outside the Docker network.
 
 ### Sync Tab
 
@@ -172,6 +168,10 @@ Navigate to: **Datacenter → Realm → Add → LDAP**
 | Group Filter | `(&(objectClass=groupOfNames)(cn=*))` |
 | Enable new users | `Yes (Default)` |
 
+- `uid` is the login attribute in FreeIPA — not `sAMAccountName` which is Active Directory only.
+- `User Filter: (objectClass=posixAccount)` — limits the sync to real user accounts, skipping service entries or anything else in the directory.
+- `User classes` and `Group classes` tell Proxmox which objectClasses to look for when identifying users and groups in LDAP.
+
 ### Remove Vanished Options
 
 | Option | State |
@@ -180,19 +180,15 @@ Navigate to: **Datacenter → Realm → Add → LDAP**
 | Entry | ✅ Enabled |
 | Properties | ✅ Enabled |
 
-These options ensure that when a user or group is removed from FreeIPA, their corresponding Proxmox entries and permissions are cleaned up automatically on the next sync.
+If a user is deleted from FreeIPA, these ensure their Proxmox entry, permissions, and attributes are cleaned up on the next sync — otherwise stale entries accumulate.
 
 ### Running the Sync
-
-After saving the realm configuration, click **Sync** from:
 
 ```
 Datacenter → Realm → select ASTEROIDEA.COM → Sync
 ```
 
-Synced users will appear under **Datacenter → Users** with the suffix `@ASTEROIDEA.COM`.
-
-To grant a FreeIPA group access to Proxmox resources:
+Synced users appear under **Datacenter → Users** with the suffix `@ASTEROIDEA.COM`. Syncing does not grant any access — you still need to assign roles explicitly:
 
 ```
 Datacenter → Permissions → Add → Group Permission
