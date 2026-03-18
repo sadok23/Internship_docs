@@ -10,7 +10,7 @@
 - [Installation](#installation)
 - [First Login](#first-login)
 - [Proxmox API Token](#proxmox-api-token)
-- [Install community.general in Semaphore](#install-communitygeneral-in-semaphore)
+- [Install Proxmox Python Dependencies](#install-proxmox-python-dependencies)
 - [Project Setup](#project-setup)
   - [1. Repository](#1-repository)
   - [2. Inventory](#2-inventory)
@@ -137,43 +137,42 @@ Since `root@pam` with privilege separation disabled inherits full permissions, n
 
 ---
 
-## Install community.general in Semaphore
+## Install Proxmox Python Dependencies
 
-The provisioning playbook uses `community.general.proxmox_kvm` which is not included in the default Ansible installation inside the Semaphore container. You need to install it manually into the Ansible virtual environment.
+The provisioning playbook uses `community.general.proxmox_kvm` which requires `proxmoxer` and `requests` to be installed in Semaphore's Ansible virtual environment.
 
 ### 1. Exec into the container
 
 ```bash
-docker exec -it semaphore /bin/sh
+docker exec -it semaphore /bin/bash
 ```
 
-### 2. Find the Ansible venv
+### 2. Install the dependencies
 
 ```bash
-find / -name "ansible" -type f 2>/dev/null | grep bin
+/opt/semaphore/apps/ansible/11.1.0/venv/bin/pip install proxmoxer requests
 ```
 
-It will typically be at `/usr/lib/python3/dist-packages/` or inside a venv like `/usr/local/lib/python3.x/`.
-
-### 3. Install the collection
+### 3. Verify
 
 ```bash
-ansible-galaxy collection install community.general
+/opt/semaphore/apps/ansible/11.1.0/venv/bin/pip list | grep -E "proxmoxer|requests"
 ```
 
-### 4. Verify
+Expected output:
 
-```bash
-ansible-galaxy collection list | grep community.general
+```
+proxmoxer          2.3.0
+requests           2.32.5
 ```
 
-### 5. Exit the container
+### 4. Exit the container
 
 ```bash
 exit
 ```
 
-> This installation persists as long as the container is not recreated. If you run `docker compose down && docker compose up`, you will need to repeat this step — or mount a persistent volume for the Ansible collections directory.
+> This installation persists as long as the container is not recreated. If you run `docker compose down && docker compose up` you will need to repeat this step.
 
 ---
 
@@ -321,6 +320,6 @@ docker compose restart semaphore
 # Update to latest image
 docker compose pull && docker compose up -d
 
-# Exec into container (e.g. to install collections)
-docker exec -it semaphore /bin/sh
+# Exec into container
+docker exec -it semaphore /bin/bash
 ```
