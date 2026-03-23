@@ -42,7 +42,7 @@ ufw default allow outgoing
 ufw default deny routed
 
 # SSH open temporarily so Ansible can finish
-ufw allow 22/tcp comment 'SSH - temporary open'
+ufw allow from "$SSH_IP" to any port 22 proto tcp comment 'SSH - admin IP only'
 ufw --force enable
 
 # ── 5. ufw-docker ──────────────────────────────────────────────────
