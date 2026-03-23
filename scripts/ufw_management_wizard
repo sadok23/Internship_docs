@@ -58,26 +58,27 @@ validate_ip() {
   return 1
 }
 
-# ── prompt_ip: printf + plain read to avoid escape code issues
+# ── FIX 1: All display output goes to stderr (>&2)
+#    so command substitution ip=$(prompt_ip) only captures the clean IP
 prompt_ip() {
   local ip
   while true; do
-    printf "  \033[0;36m›\033[0m IP address: "
+    printf "  \033[0;36m›\033[0m IP address: " >&2
     read -r ip
     if validate_ip "$ip"; then
-      echo "$ip"
+      echo "$ip"   # only this goes to stdout → captured by $(...)
       return
     else
-      echo -e "  ${FAIL} ${RED}Invalid IP format. Example: 192.168.1.10${NC}"
+      echo -e "  ${FAIL} ${RED}Invalid IP format. Example: 192.168.1.10${NC}" >&2
     fi
   done
 }
 
-# ── Generic prompt using printf ──────────────────────────────
+# ── Generic prompt: display to stderr, value to stdout ───────
 prompt() {
   local msg=$1
   local result
-  printf "  \033[0;36m›\033[0m %s" "$msg"
+  printf "  \033[0;36m›\033[0m %s" "$msg" >&2
   read -r result
   echo "$result"
 }
@@ -94,12 +95,18 @@ back_or_exit() {
   esac
 }
 
+# ── FIX 2: replace grep -E '^\[ *[0-9]+\]' with awk '/^\[/'
+#    \[ in POSIX ERE is undefined and errors on some systems
+ufw_numbered_rules() {
+  ufw status numbered 2>/dev/null | awk '/^\[/'
+}
+
 # ── Main menu ────────────────────────────────────────────────
 main_menu() {
   header
 
   local rule_count
-  rule_count=$(ufw status numbered 2>/dev/null | grep -cE '^\[ *[0-9]+\]' || echo 0)
+  rule_count=$(ufw_numbered_rules | wc -l)
   local ufw_status
   ufw_status=$(ufw status | head -1 | awk '{print $2}')
 
@@ -141,8 +148,14 @@ allow_ssh() {
   local ip
   ip=$(prompt_ip)
 
-  if ufw status | grep -q "from $ip.*22\b"; then
-    echo -e "\n  ${WARN} ${YELLOW}SSH rule already exists for ${BOLD}$ip${NC}"
+  if ufw status | grep -qF "from $ip"; then
+    if ufw status | grep "from $ip" | grep -q '\b22\b'; then
+      echo -e "\n  ${WARN} ${YELLOW}SSH rule already exists for ${BOLD}$ip${NC}"
+    else
+      ufw allow from "$ip" to any port 22 proto tcp comment "SSH - $ip" > /dev/null
+      ufw reload > /dev/null
+      echo -e "\n  ${OK} ${GREEN}SSH access granted to ${BOLD}$ip${NC}"
+    fi
   else
     ufw allow from "$ip" to any port 22 proto tcp comment "SSH - $ip" > /dev/null
     ufw reload > /dev/null
@@ -241,7 +254,7 @@ _allow_container() {
     port=$(echo "$port_proto" | cut -d'/' -f1)
     proto=$(echo "$port_proto" | cut -d'/' -f2)
 
-    if ufw status | grep -q "$container_ip $port/$proto.*$ip"; then
+    if ufw status | grep -qF "$container_ip" | grep -q "$port/$proto.*$ip" 2>/dev/null; then
       echo -e "    ${WARN} ${YELLOW}Rule already exists for port $port/$proto${NC}"
     else
       ufw route allow proto "$proto" from "$ip" to "$container_ip" port "$port" \
@@ -261,7 +274,8 @@ revoke_ip() {
   ip=$(prompt_ip)
   echo ""
 
-  mapfile -t matched < <(ufw status numbered | grep -E '^\[ *[0-9]+\]' | grep "$ip")
+  # Use -F (fixed string) so the IP is never interpreted as a regex
+  mapfile -t matched < <(ufw_numbered_rules | grep -F "$ip")
 
   if [ ${#matched[@]} -eq 0 ]; then
     echo -e "  ${WARN} ${YELLOW}No rules found for ${BOLD}$ip${NC}"
@@ -289,10 +303,11 @@ revoke_ip() {
 
   local deleted=0
   while true; do
-    mapfile -t current < <(ufw status numbered | grep -E '^\[ *[0-9]+\]' | grep "$ip")
+    mapfile -t current < <(ufw_numbered_rules | grep -F "$ip")
     [ ${#current[@]} -eq 0 ] && break
+    # Extract the rule number from the leading [ N] tag
     local rule_num
-    rule_num=$(echo "${current[0]}" | grep -oP '(?<=\[)\s*\d+(?=\])' | tr -d ' ')
+    rule_num=$(echo "${current[0]}" | awk -F'[][]' '{print $2}' | tr -d ' ')
     yes | ufw delete "$rule_num" > /dev/null 2>&1
     ((deleted++))
   done
@@ -309,7 +324,7 @@ delete_rule() {
   section "Delete a Specific Rule"
   echo ""
 
-  mapfile -t raw_rules < <(ufw status numbered | grep -E '^\[ *[0-9]+\]')
+  mapfile -t raw_rules < <(ufw_numbered_rules)
 
   if [ ${#raw_rules[@]} -eq 0 ]; then
     echo -e "  ${WARN} ${YELLOW}No UFW rules found.${NC}"
@@ -373,7 +388,7 @@ delete_rule() {
     read -r confirm
     if [[ ${confirm,,} == "y" ]]; then
       local rule_num
-      rule_num=$(echo "$rule_line" | grep -oP '(?<=\[)\s*\d+(?=\])' | tr -d ' ')
+      rule_num=$(echo "$rule_line" | awk -F'[][]' '{print $2}' | tr -d ' ')
       yes | ufw delete "$rule_num" > /dev/null 2>&1
       ufw reload > /dev/null
       echo -e "\n  ${OK} ${GREEN}Rule deleted.${NC}"
@@ -393,11 +408,10 @@ list_access() {
   section "IPs With Access"
   echo ""
 
-  # Extract all unique source IPs from ufw status
   mapfile -t ips < <(
     ufw status | grep -E 'ALLOW|FWD' \
     | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
-    | grep -v '^172\.\|^10\.\|^192\.168\.' \
+    | grep -vE '^172\.|^10\.|^192\.168\.' \
     | sort -u
   )
 
@@ -410,20 +424,15 @@ list_access() {
   for ip in "${ips[@]}"; do
     echo -e "  ${BOLD}${CYAN}$ip${NC}"
 
-    # SSH
-    if ufw status | grep -E "ALLOW IN" | grep -q "from $ip\b.*22\b\|$ip.*port 22"; then
+    if ufw status | grep -F "$ip" | grep -q '22'; then
       echo -e "    ${OK}  SSH ${DIM}(port 22)${NC}"
     fi
 
-    # Container route rules for this IP
     while IFS= read -r line; do
-      # Match forward/route rules containing this IP
       if echo "$line" | grep -qE 'ALLOW FWD|FWD.*ALLOW'; then
-        # Extract destination IP:port
         local dest
         dest=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3} [0-9]+/[a-z]+' | head -1)
         if [ -n "$dest" ]; then
-          # Try to match container name from comment
           local cname=""
           cname=$(echo "$line" | sed 's/.*# //' | sed 's/ - .*//' | xargs 2>/dev/null || true)
           if [ -n "$cname" ] && [ "$cname" != "$line" ]; then
@@ -433,7 +442,7 @@ list_access() {
           fi
         fi
       fi
-    done < <(ufw status | grep "$ip")
+    done < <(ufw status | grep -F "$ip")
 
     echo ""
   done
