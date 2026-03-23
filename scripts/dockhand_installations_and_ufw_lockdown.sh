@@ -143,7 +143,6 @@ SERVER_IP=$(hostname -I | awk '{print $1}')
 echo "----------------------------------------------------------------"
 echo "SUCCESS"
 echo "  Admin IP      : $SSH_IP"
-echo "  SSH           : port 22 (temporarily open — locked after)"
 echo "  Traefik HTTP  : http://$SERVER_IP:80       → admin IP only"
 echo "  Traefik HTTPS : https://$SERVER_IP:443     → admin IP only"
 echo "  Traefik UI    : http://$SERVER_IP:8081     → admin IP only"
