@@ -142,7 +142,7 @@ Navigate to: **Datacenter → Realm → Add → LDAP**
 | Field | Value |
 |---|---|
 | Realm | `ASTEROIDEA.COM` |
-| Base Domain Name | `dc=asteroidea,dc=com` |
+| Base Domain Name | `cn=accounts,dc=asteroidea,dc=com` |
 | User Attribute Name | `uid` |
 | Server | `ipa.asteroidea.com` |
 | Fallback Server | *(empty)* |
