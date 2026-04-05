@@ -11,6 +11,7 @@
 - [First Login](#first-login)
 - [Proxmox API Token](#proxmox-api-token)
 - [Install Proxmox Python Dependencies](#install-proxmox-python-dependencies)
+- [GitLab Repository Access](#gitlab-repository-access)
 - [Project Setup](#project-setup)
   - [1. Repository](#1-repository)
   - [2. Inventory](#2-inventory)
@@ -25,7 +26,7 @@
 
 - Docker and Docker Compose installed
 - A Proxmox host accessible on your network
-- Your playbooks stored in a GitHub repository
+- Your playbooks stored in a GitLab repository
 
 ---
 
@@ -176,6 +177,72 @@ exit
 
 ---
 
+## GitLab Repository Access
+
+The playbooks repository is hosted on a private GitLab instance (`git.asteroidea.co`) and accessed over SSH. This section covers generating an SSH key pair, registering it with GitLab, and configuring Semaphore to use it.
+
+### 1. Generate an SSH Key Pair
+
+Run this on any machine with `ssh-keygen` available (your local workstation is fine):
+
+**Linux / macOS:**
+```bash
+ssh-keygen -t ed25519 -C "semaphore" -f ~/semaphore_gitlab -N ""
+```
+
+**Windows (PowerShell):**
+```powershell
+ssh-keygen -t ed25519 -C "semaphore" -f C:\Users\<you>\semaphore_gitlab
+```
+When prompted for a passphrase, press **Enter** twice to leave it empty.
+
+This produces two files:
+
+| File | Purpose |
+|------|---------|
+| `semaphore_gitlab` | Private key — goes into Semaphore |
+| `semaphore_gitlab.pub` | Public key — goes into GitLab |
+
+### 2. Add the Public Key to GitLab
+
+Go to your GitLab group `it_automation` → **Settings → Repository → Deploy keys**:
+
+| Field | Value |
+|-------|-------|
+| Title | `semaphore` (or any label) |
+| Key | Contents of `semaphore_gitlab.pub` |
+| Grant write permissions | Off (read-only is sufficient) |
+
+> If you do not have group maintainer access, add the key under your personal **User Settings → SSH Keys** instead.
+
+### 3. Add the Private Key to Semaphore
+
+In Semaphore go to **Key Store → New Key**:
+
+| Field | Value |
+|-------|-------|
+| Name | `gitlab-deploy` |
+| Type | `SSH Key` |
+| Private Key | Contents of `semaphore_gitlab` (no extension) |
+
+### 4. Trust the GitLab Host
+
+SSH refuses to connect to a host it has never seen before. Since Semaphore runs non-interactively it will silently fail on first clone. Pre-populate `known_hosts` inside the container:
+
+```bash
+docker exec -it semaphore sh -c "ssh-keyscan git.asteroidea.co >> ~/.ssh/known_hosts"
+```
+
+Verify it was written:
+
+```bash
+docker exec -it semaphore cat ~/.ssh/known_hosts
+```
+
+> This step must be repeated if the container is recreated, since `~/.ssh` is not in a named volume. To make it persistent, mount a host directory for `~/.ssh` in `docker-compose.yml`.
+
+---
+
 ## Project Setup
 
 In Semaphore, create a new **Project** first. Everything below lives inside it.
@@ -186,16 +253,16 @@ In Semaphore, create a new **Project** first. Everything below lives inside it.
 
 ### 1. Repository
 
-The Repository connects Semaphore to your GitHub repo where the playbooks live.
+The Repository connects Semaphore to your GitLab repo where the playbooks live.
 
 **Navigate to:** Project → Repositories → `+ New Repository`
 
 | Field | Value |
 |-------|-------|
 | Name | `provisioning-playbooks` |
-| URL | `https://github.com/<your-username>/<your-repo>` |
+| URL | `git@git.asteroidea.co:it_automation/playbooks.git` |
 | Branch | `main` |
-| Access Key | None *(for public repos)* or a GitHub token key for private repos |
+| Access Key | `gitlab-deploy` |
 
 ---
 
@@ -322,4 +389,7 @@ docker compose pull && docker compose up -d
 
 # Exec into container
 docker exec -it semaphore /bin/bash
+
+# Re-trust GitLab host after container recreation
+docker exec -it semaphore sh -c "ssh-keyscan git.asteroidea.co >> ~/.ssh/known_hosts"
 ```
