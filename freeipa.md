@@ -6,8 +6,57 @@
 
 FreeIPA is a full identity management stack — it bundles a **389 Directory Server** (LDAP), **MIT Kerberos**, and a **PKI/CA** into a single container. That's why `--privileged` is mandatory: it needs real kernel-level access that normal containers don't get.
 
-```bash
-sudo docker run -it \
+Option A — Native Install (dnf)
+This is the straightforward approach when FreeIPA runs on a dedicated VM (e.g., a Proxmox VM running AlmaLinux/Rocky/RHEL).
+Prerequisites:
+
+Set the hostname before installing — FreeIPA hardcodes it into every certificate and Kerberos principal at install time.
+Add a hosts entry for the FQDN — the installer does a forward+reverse DNS lookup before doing anything else. Even if FreeIPA will eventually serve DNS itself, the name must resolve before the installer runs.
+
+bash# Set the hostname
+sudo hostnamectl set-hostname ipa.asteroidea.co
+
+# Add hosts entry (replace IP with your VM's actual IP)
+echo "20.0.1.176  ipa.asteroidea.co  ipa" | sudo tee -a /etc/hosts
+
+# Verify
+hostname -f        # must return ipa.asteroidea.co
+ping -c1 ipa.asteroidea.co
+Install and run:
+bashsudo dnf install -y freeipa-server freeipa-server-dns
+
+sudo ipa-server-install \
+  --realm=ASTEROIDEA.CO \
+  --domain=asteroidea.co \
+  --hostname=ipa.asteroidea.co \
+  --ds-password='<DS_PASSWORD>' \
+  --admin-password='<ADMIN_PASSWORD>' \
+  --unattended \
+  --no-ntp \
+  --skip-mem-check
+
+--no-ntp — skips the built-in Chrony setup. Keep the host clock accurate — Kerberos has a 5-minute skew tolerance and hard-rejects auth if clocks drift.
+--skip-mem-check — bypasses the RAM requirement check. Useful on constrained VMs; FreeIPA runs fine with 2GB in a homelab context.
+
+Open firewall ports after install:
+FreeIPA's installer does not always add firewalld rules automatically. Add them explicitly:
+bashsudo firewall-cmd --add-service=freeipa-ldap --permanent
+sudo firewall-cmd --add-service=freeipa-ldaps --permanent
+sudo firewall-cmd --add-service=https --permanent
+sudo firewall-cmd --add-service=http --permanent
+sudo firewall-cmd --reload
+
+# Verify
+sudo firewall-cmd --list-services
+Access the UI:
+Navigate to https://ipa.asteroidea.co from a browser. The client machine must also resolve the hostname — add the same hosts entry, or create a DNS host override in OPNsense under Services → Unbound DNS → Host Overrides.
+
+Browser tip: FreeIPA's login page shows a Kerberos/GSSAPI prompt before the form login. If your machine isn't domain-joined, press Cancel (twice) to reach the normal username/password form. To suppress this permanently in Firefox, go to about:config and set network.negotiate-auth.trusted-uris to ipa.asteroidea.co — Firefox will skip the prompt silently.
+
+
+Option B — Docker Container
+FreeIPA is a full identity management stack — it bundles a 389 Directory Server (LDAP), MIT Kerberos, and a PKI/CA into a single container. That's why --privileged is mandatory: it needs real kernel-level access that normal containers don't get.
+bashsudo docker run -it \
   --name freeipa-server \
   --hostname ipa.asteroidea.com \
   --privileged \
@@ -29,14 +78,11 @@ sudo docker run -it \
     --admin-password='<ADMIN_PASSWORD>' \
     --unattended \
     --no-ntp
-```
 
-- `--hostname ipa.asteroidea.com` — FreeIPA hardcodes this into every certificate and Kerberos principal it generates at install time. It must match what clients use to reach it, otherwise TLS and Kerberos break.
-- `-v /opt/freeipa-data:/data` — persists the entire identity server (LDAP database, CA, Kerberos keys) across container restarts. Without this, everything is wiped on restart.
-- `--no-ntp` — skips the built-in Chrony setup since the host manages time sync. Keep the host clock accurate — Kerberos has a 5-minute skew tolerance and hard-rejects auth if clocks drift.
-- Ports `88` and `464` (TCP + UDP) — Kerberos authentication and the `kpasswd` service. Both need TCP and UDP because Kerberos uses UDP for small packets and falls back to TCP for larger ones.
-
----
+--hostname ipa.asteroidea.com — FreeIPA hardcodes this into every certificate and Kerberos principal it generates at install time. It must match what clients use to reach it, otherwise TLS and Kerberos break.
+-v /opt/freeipa-data:/data — persists the entire identity server (LDAP database, CA, Kerberos keys) across container restarts. Without this, everything is wiped on restart.
+--no-ntp — skips the built-in Chrony setup since the host manages time sync. Keep the host clock accurate — Kerberos has a 5-minute skew tolerance and hard-rejects auth if clocks drift.
+Ports 88 and 464 (TCP + UDP) — Kerberos authentication and the kpasswd service. Both need TCP and UDP because Kerberos uses UDP for small packets and falls back to TCP for larger ones.
 
 ## 2. Self-Service Password Portal
 
